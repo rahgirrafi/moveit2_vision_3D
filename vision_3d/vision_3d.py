@@ -13,7 +13,7 @@ from geometry_msgs.msg import PointStamped, PoseStamped, Pose
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
 import sensor_msgs_py.point_cloud2 as pc2
-
+from geometry_msgs.msg import PoseStamped
 import cv2
 from cv_bridge import CvBridge
 import numpy as np
@@ -111,7 +111,7 @@ class ButtonPressVisionNode(Node):
         self.normal_marker_pub = self.create_publisher(Marker, '/button/normal_marker', 10)
         self.segmentation_pub = self.create_publisher(Image, '/button/segmentation', 10)
         self.detection_pub = self.create_publisher(Image, '/button/detection', 10)
-        
+        self.pose_pub = self.create_publisher(PoseStamped, '/button/target_pose', 10)
         # Initialize SAM2 + Grounding DINO
         if SAM2_AVAILABLE:
             self.init_sam2_grounding_dino()
@@ -630,6 +630,46 @@ class ButtonPressVisionNode(Node):
         except Exception as e:
             self.get_logger().error(f'Transform failed: {e}')
             return None, None
+        
+    def create_pose_from_point_normal(self, point, normal):
+        """
+        Create PoseStamped with Z-axis of camera_frame aligned to normal
+        Returns: PoseStamped message
+        """
+        pose = PoseStamped()
+        pose.header.frame_id = self.get_parameter('base_frame').value
+        pose.header.stamp = self.get_clock().now().to_msg()
+        
+        # Set position
+        pose.pose.position.x = float(point[0])
+        pose.pose.position.y = float(point[1])
+        pose.pose.position.z = float(point[2])
+        
+        # Create rotation matrix with Z-axis aligned to normal
+        z_axis = normal / np.linalg.norm(normal)
+        
+        # Choose initial X-axis (avoid parallel to Z)
+        x_axis = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(x_axis, z_axis)) > 0.9:
+            x_axis = np.array([0.0, 1.0, 0.0])
+        
+        # Build orthonormal frame
+        y_axis = np.cross(z_axis, x_axis)
+        y_axis /= np.linalg.norm(y_axis)
+        x_axis = np.cross(y_axis, z_axis)
+        x_axis /= np.linalg.norm(x_axis)
+        
+        # Create rotation matrix [X Y Z] as columns
+        rot_matrix = np.column_stack([x_axis, y_axis, z_axis])
+        rot = Rotation.from_matrix(rot_matrix)
+        quat = rot.as_quat()  # [x, y, z, w]
+        
+        pose.pose.orientation.x = float(quat[0])
+        pose.pose.orientation.y = float(quat[1])
+        pose.pose.orientation.z = float(quat[2])
+        pose.pose.orientation.w = float(quat[3])
+        
+        return pose
     
     def publish_visualizations(self, centroid_base, normal_base):
         """Publish visualization markers"""
@@ -670,6 +710,7 @@ class ButtonPressVisionNode(Node):
         marker.points.append(end.position)
         
         self.normal_marker_pub.publish(marker)
+        
     
     def create_combined_visualization(self, rgb, detection, segmentation, depth):
         """Create 2x2 grid of all visualizations"""
@@ -784,7 +825,17 @@ class ButtonPressVisionNode(Node):
         
         self.get_logger().info(f'Centroid (base frame): [{centroid_base[0]:.3f}, {centroid_base[1]:.3f}, {centroid_base[2]:.3f}]')
         self.get_logger().info(f'Normal (base frame): [{normal_base[0]:.3f}, {normal_base[1]:.3f}, {normal_base[2]:.3f}]')
+        target_pose = self.create_pose_from_point_normal(centroid_base, normal_base)
+        self.pose_pub.publish(target_pose)
         
+        self.get_logger().info('Published target pose:')
+        self.get_logger().info(f'  Position: [{target_pose.pose.position.x:.3f}, '
+                              f'{target_pose.pose.position.y:.3f}, '
+                              f'{target_pose.pose.position.z:.3f}]')
+        self.get_logger().info(f'  Orientation (quat): [{target_pose.pose.orientation.x:.3f}, '
+                              f'{target_pose.pose.orientation.y:.3f}, '
+                              f'{target_pose.pose.orientation.z:.3f}, '
+                              f'{target_pose.pose.orientation.w:.3f}]')
         # Step 5: Publish visualizations
         self.publish_visualizations(centroid_base, normal_base)
         # Create combined view
